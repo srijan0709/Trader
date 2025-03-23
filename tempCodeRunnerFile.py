@@ -1,1 +1,0 @@
-df.reset_index(drop=True, inplace=True)
