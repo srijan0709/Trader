@@ -2,6 +2,9 @@ import requests
 import pandas as pd
 import ta
 from tqdm import tqdm as tq  
+import os
+from config import STOCKS
+
 class StockDataFetcher:
     def __init__(self):
         self.api_key = "PKW0YNTXIQBYEO0GHQS4"
@@ -129,7 +132,7 @@ def generateTargetDataBuySide(df, target, stop_loss):
     target_data = []
     for i in tq(range(len(df)), desc="Processing Buy Side Data"):
         temp,next_step = getNextStateBuySide(df.iloc[i], target, stop_loss, df.iloc[i:].reset_index(drop=True))
-        temp["next_state_index"] = next_step +i
+        temp["next_state_index"] = next_step + i
         target_data.append(temp)
     df = pd.DataFrame(target_data)
     df.reset_index(drop=True, inplace=True)
@@ -156,8 +159,8 @@ def getTechnicalIndicators(data):
     This will return the technical indicators for the stock data'
     '''
     # Calculate technical indicators
-    data['MA50'] = ta.trend.sma_indicator(data['close'], window=30)
-    data['RSI'] = ta.momentum.rsi(data['close'], window=30)
+    data['MA50'] = ta.trend.sma_indicator(data['close'], window=15)
+    data['RSI'] = ta.momentum.rsi(data['close'], window=15)
     data['MACD'] = ta.trend.macd(data['close'])
     data['BB_upper'] = ta.volatility.bollinger_hband(data['close'])
     data['BB_lower'] = ta.volatility.bollinger_lband(data['close'])
@@ -231,3 +234,288 @@ def normalize_new_row_with_mean_std(row, normalization_params):
             normalized_row[col] = row[col].hour*60 + row[col].minute-540
     
     return normalized_row
+
+class UpstoxStockDataFetcher:
+    def __init__(self):
+        self.base_url = "https://api.upstox.com/v2/historical-candle/NSE_EQ%7C"
+        
+    
+    def get_stock_data(self, symbol: str, start_date: str, end_date: str,timeframe: str = "1minute"):
+        isin_number = STOCKS[symbol]
+
+        url = f"{self.base_url}{isin_number}/{timeframe}/{end_date}/{start_date}"
+        
+        headers = {
+                 'Accept': 'application/json'}
+        
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['data']['candles']
+            df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'Open_Interest'])
+            df.drop(columns=['Open_Interest'], inplace=True)
+            df = df.iloc[::-1].reset_index(drop=True)  # Reverse the order of rows
+            df['time'] = pd.to_datetime(df['time'])
+            return df
+        else:
+            print(url)
+            return {"error": f"Request failed with status code {response.status_code} "}
+        
+# https://upstox.com/developer/api-documentation/open-api
+
+class UpstoxTrader():
+    def __init__(self):
+        self.access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+    
+    def get_margin(self):
+        url = 'https://api.upstox.com/v2/user/get-funds-and-margin?segment=SEC'
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            data = response.json()
+            return data['data']['equity']['available_margin']
+        else:
+            print(f"Error fetching margin: {response.status_code}")
+            return None
+    
+    def MarketStatus(self):
+        url = 'https://api.upstox.com/v2/market/status/NSE'
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            data = response.json()['data']
+            status = data['status']
+            timestamp = data['timestamp']['last_updated']
+            if status == 'NORMAL_OPEN':
+                return True,timestamp
+            else:
+                return False,timestamp    
+        else:
+            print(f"Error fetching market status: {response.status_code}")
+            return None
+        
+    def getPositions(self):
+        url = 'https://api.upstox.com/v2/portfolio/short-term-positions'
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            data = response.json()
+            return data
+        else:
+            print(f"Error fetching position: {response.status_code}")
+            return None
+    
+    def IntraMarketOrder(self, symbol, quantity, action):
+        url = 'https://api-hft.upstox.com/v2/order/place'
+        headers = {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Authorization': f'Bearer {self.access_token}',
+                     }
+        data = {
+            'quantity': quantity,
+            'product': 'I',
+            'validity': 'DAY',
+            'price': 0,
+            'tag': 'string',
+            'instrument_token': symbol,
+            'order_type': 'MARKET',
+            'transaction_type': action,  # 'BUY' or 'SELL'
+            'disclosed_quantity': 0,
+            'trigger_price': 0,
+            'is_amo': False,
+            }
+
+        try:
+            # Send the POST request
+            response = requests.post(url, json=data, headers=headers)
+            # Print the response status code and body
+            print('Response Code:', response.status_code)
+            print('Response Body:', response.json())
+            return response
+
+        except Exception as e:
+            # Handle exceptions
+            print('Error:', str(e))
+            return None
+        
+    def IntraLimitOrder(self, symbol, quantity, action, price):
+        url = 'https://api-hft.upstox.com/v2/order/place'
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}',
+        }
+
+        data = {
+            'quantity': quantity,
+            'product': 'I',
+            'validity': 'DAY',
+            'price': price,
+            'tag': 'string',
+            'instrument_token': symbol,
+            'order_type': 'LIMIT',
+            'transaction_type': action,
+            'disclosed_quantity': 0,
+            'trigger_price': 20.1,
+            'is_amo': False,
+        }
+
+        try:
+            # Send the POST request
+            response = requests.post(url, json=data, headers=headers)
+
+            # Print the response status code and body
+            print('Response Code:', response.status_code)
+            print('Response Body:', response.json())
+
+            return response
+
+        except Exception as e:
+            # Handle exceptions
+            print('Error:', str(e))
+            return None
+
+    def IntraDayStopLossOrder(self, symbol, quantity, action, price):
+        url = 'https://api-hft.upstox.com/v2/order/place'
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}',
+        }
+
+        data = {
+            'quantity': quantity,
+            'product': 'I',
+            'validity': 'DAY',
+            'price': 0.0,
+            'tag': 'string',
+            'instrument_token': symbol,
+            'order_type': 'SL-M',
+            'transaction_type': action,  
+            'disclosed_quantity': 0,
+            'trigger_price': price,
+            'is_amo': False,
+        }
+
+        try:
+            # Send the POST request
+            response = requests.post(url, json=data, headers=headers)
+
+            # Print the response status code and body
+            print('Response Code:', response.status_code)
+            print('Response Body:', response.json())
+
+            return response
+
+        except Exception as e:
+            # Handle exceptions
+            print('Error:', str(e))
+            return None
+
+    def CancelOrder(self, order_id):
+        """
+        Cancel an order by its order ID.
+
+        Args:
+            order_id (str): The order ID to cancel.
+
+        Returns:
+            requests.Response: The response from the API.
+        """
+        
+        url = f'https://api-hft.upstox.com/v2/order/cancel?order_id={order_id}'
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+        try:
+            response = requests.delete(url, headers=headers)
+
+            print(response.text)
+
+            return response
+
+        except Exception as e:
+            print('Error:', str(e))
+            return None
+        
+    def getCharges(self,start_date, end_date):
+        """
+        Get the charges for a given date range.
+
+        Args:
+            start_date (str): The start date in 'YYYY-MM-DD' format.
+            end_date (str): The end date in 'YYYY-MM-DD' format.
+
+        Returns:
+            dict: A dictionary containing the charges.
+        """
+        url = 'https://api.upstox.com/v2/trade/profit-loss/charges'
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}' 
+        }
+
+        params = {
+            'from_date': start_date,
+            'to_date': end_date,
+            'segment': 'EQ',
+            'financial_year': '2526'
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+
+            return response.json() 
+        except Exception as e:
+            print('Error:', str(e))
+            return None
+        
+    def getProfitLoss(self,start_date, end_date):
+        """
+        Get the profit and loss for a given date range.
+
+        Args:
+            start_date (str): The start date in 'DD-MM-YYYY' format.
+            end_date (str): The end date in 'DD-MM-YYYY' format.
+
+        Returns:
+            dict: A dictionary containing the profit and loss data.
+        """
+        url = 'https://api.upstox.com/v2/trade/profit-loss/data'
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}' 
+        }
+
+        params = {
+            'from_date': start_date,
+            'to_date': end_date,
+            'segment': 'EQ',
+            'financial_year': '2526',   ## TO do make this a func of startdate and end date
+            'page_number': '1',
+            'page_size': '4'
+            }
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+
+            return response.json() 
+        except Exception as e:
+            print('Error:', str(e))
+            return None
