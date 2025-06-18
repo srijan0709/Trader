@@ -4,11 +4,12 @@ import ta
 from tqdm import tqdm as tq  
 import os
 from config import STOCKS
+from collections import deque
 
 class StockDataFetcher:
     def __init__(self):
-        self.api_key = "PKW0YNTXIQBYEO0GHQS4"
-        self.api_secret = "r0obc1M6nmK1k9aTF7OixLHtGB0PCLBR9RFAJ2Rm"
+        self.api_key = os.getenv("ALPACA_API_KEY")
+        self.api_secret = os.getenv("ALPACA_SECRET_KEY")
         self.base_url = "https://data.alpaca.markets/v2/stocks/bars"
     
     def get_stock_data(self, symbol: str, start_date: str, end_date: str,timeframe: str = "1Min", limit: int = 5000):
@@ -159,8 +160,8 @@ def getTechnicalIndicators(data):
     This will return the technical indicators for the stock data'
     '''
     # Calculate technical indicators
-    data['MA50'] = ta.trend.sma_indicator(data['close'], window=15)
-    data['RSI'] = ta.momentum.rsi(data['close'], window=15)
+    data['MA50'] = ta.trend.sma_indicator(data['close'], window=28)
+    data['RSI'] = ta.momentum.rsi(data['close'], window=28)
     data['MACD'] = ta.trend.macd(data['close'])
     data['BB_upper'] = ta.volatility.bollinger_hband(data['close'])
     data['BB_lower'] = ta.volatility.bollinger_lband(data['close'])
@@ -267,7 +268,7 @@ class UpstoxTrader():
         self.access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
     
     def get_margin(self):
-        url = 'https://api.upstox.com/v2/user/get-funds-and-margin?segment=SEC'
+        url = 'https://api.upstox.com/v2/user/get-funds-and-margin'
         headers = {
             'Accept': 'application/json',
             'Authorization': f'Bearer {self.access_token}'
@@ -294,11 +295,11 @@ class UpstoxTrader():
         if response.status_code == 200:
             data = response.json()['data']
             status = data['status']
-            timestamp = data['timestamp']['last_updated']
+            
             if status == 'NORMAL_OPEN':
-                return True,timestamp
+                return True
             else:
-                return False,timestamp    
+                return False 
         else:
             print(f"Error fetching market status: {response.status_code}")
             return None
@@ -320,6 +321,8 @@ class UpstoxTrader():
             return None
     
     def IntraMarketOrder(self, symbol, quantity, action):
+        symbol = STOCKS[symbol]  # Get the ISIN number from the STOCKS dictionary
+        symbol= "NSE_EQ|" + symbol
         url = 'https://api-hft.upstox.com/v2/order/place'
         headers = {
                     'Content-Type': 'application/json',
@@ -346,7 +349,7 @@ class UpstoxTrader():
             # Print the response status code and body
             print('Response Code:', response.status_code)
             print('Response Body:', response.json())
-            return response
+            return response.json()
 
         except Exception as e:
             # Handle exceptions
@@ -354,6 +357,8 @@ class UpstoxTrader():
             return None
         
     def IntraLimitOrder(self, symbol, quantity, action, price):
+        symbol = STOCKS[symbol]
+        symbol= "NSE_EQ|" + symbol
         url = 'https://api-hft.upstox.com/v2/order/place'
         headers = {
             'Content-Type': 'application/json',
@@ -383,7 +388,7 @@ class UpstoxTrader():
             print('Response Code:', response.status_code)
             print('Response Body:', response.json())
 
-            return response
+            return response.json()
 
         except Exception as e:
             # Handle exceptions
@@ -391,6 +396,8 @@ class UpstoxTrader():
             return None
 
     def IntraDayStopLossOrder(self, symbol, quantity, action, price):
+        symbol = STOCKS[symbol]
+        symbol= "NSE_EQ|" + symbol
         url = 'https://api-hft.upstox.com/v2/order/place'
         headers = {
             'Content-Type': 'application/json',
@@ -420,7 +427,7 @@ class UpstoxTrader():
             print('Response Code:', response.status_code)
             print('Response Body:', response.json())
 
-            return response
+            return response.json()
 
         except Exception as e:
             # Handle exceptions
@@ -448,7 +455,7 @@ class UpstoxTrader():
 
             print(response.text)
 
-            return response
+            return response.json()
 
         except Exception as e:
             print('Error:', str(e))
@@ -459,8 +466,8 @@ class UpstoxTrader():
         Get the charges for a given date range.
 
         Args:
-            start_date (str): The start date in 'YYYY-MM-DD' format.
-            end_date (str): The end date in 'YYYY-MM-DD' format.
+            start_date (str): The start date in 'dd-mm-yyyy' format.
+            end_date (str): The end date in 'dd-mm-yyyy' format.
 
         Returns:
             dict: A dictionary containing the charges.
@@ -519,3 +526,67 @@ class UpstoxTrader():
         except Exception as e:
             print('Error:', str(e))
             return None
+    
+    def getOrderDetails(self,order_id):
+        url = 'https://api.upstox.com/v2/order/details'
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+
+        params = {'order_id': order_id}
+        response = requests.get(url, headers=headers, params=params)
+
+        return response.json()
+        
+class TechnicalIndicatorWindow:
+    def __init__(self, window_size=28):
+        self.window_size = window_size
+        self.data = deque(maxlen=window_size)
+
+    def update(self, ohlcv_bar):
+        """
+        Add a new OHLCV bar to the window.
+        ohlcv_bar = {
+            'timestamp': ..., 
+            'open': ..., 
+            'high': ..., 
+            'low': ..., 
+            'close': ..., 
+            'volume': ...
+        }
+        """
+        self.data.append(ohlcv_bar)
+
+    def _get_dataframe(self):
+        df = pd.DataFrame(list(self.data))
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')  # convert to float/int
+        return df
+
+    def get_feature_row(self):
+        """
+        Returns the latest feature vector (technical indicators) for the model.
+        Returns None if not enough data for indicators.
+        """
+        df = self._get_dataframe()
+        if len(df) < 28:  # Minimum required for indicators like ADX, RSI, etc.
+            return None
+        
+        df['MA50'] = ta.trend.sma_indicator(df['close'], window=self.window_size)
+        df['RSI'] = ta.momentum.rsi(df['close'], window=self.window_size)
+        df['MACD'] = ta.trend.macd(df['close'])
+        df['BB_upper'] = ta.volatility.bollinger_hband(df['close'])
+        df['BB_lower'] = ta.volatility.bollinger_lband(df['close'])
+        df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'])
+        df['CCI'] = ta.trend.cci(df['high'], df['low'], df['close'])
+        df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'])
+        df['ROC'] = ta.momentum.roc(df['close'])
+        df['OBV'] = ta.volume.on_balance_volume(df['close'], df['volume'])
+
+        df = df.dropna()
+        if df.empty:
+            print("Not enough data to compute indicators.")
+            return None
+
+        latest_features = df.iloc[-1]
+        return latest_features

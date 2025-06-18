@@ -12,6 +12,7 @@ import threading
 from datetime import datetime, timedelta
 market_data_store = {}
 data_lock = threading.Lock()
+from config import STOCKS
 
 def get_market_data_feed_authorize_v3():
     """Get authorization for market data feed."""
@@ -91,7 +92,7 @@ def update_market_data(data_dict):
                                 }
                                 break
 
-def get_latest_ohlc_volume(instrument_key="NSE_EQ|INE155A01022"):
+def get_latest_ohlc_volume(symbol="SUZLON"):
     """
     Get the latest OHLC volume data for the last minute.
     
@@ -101,6 +102,8 @@ def get_latest_ohlc_volume(instrument_key="NSE_EQ|INE155A01022"):
     Returns:
         dict: Dictionary containing OHLC volume data or None if no data available
     """
+    instrument_key = STOCKS[symbol]
+    instrument_key = "NSE_EQ|" + instrument_key
     with data_lock:
         if instrument_key not in market_data_store:
             return None
@@ -110,14 +113,12 @@ def get_latest_ohlc_volume(instrument_key="NSE_EQ|INE155A01022"):
         # If we have pre-calculated OHLC from feed, return that
         if data['ohlc_1min']:
             return {
-                'instrument_key': instrument_key,
+                'timestamp': data['ohlc_1min']['timestamp'],
                 'open': data['ohlc_1min']['open'],
                 'high': data['ohlc_1min']['high'],
                 'low': data['ohlc_1min']['low'],
                 'close': data['ohlc_1min']['close'],
                 'volume': data['ohlc_1min']['volume'],
-                'timestamp': data['ohlc_1min']['timestamp'],
-                'data_source': 'feed_ohlc'
             }
         
         # Otherwise calculate from trade data
@@ -133,19 +134,18 @@ def get_latest_ohlc_volume(instrument_key="NSE_EQ|INE155A01022"):
             return None
         
         return {
-            'instrument_key': instrument_key,
+            'timestamp': datetime.now(),
             'open': prices[0],  # First price in the minute
             'high': max(prices),
             'low': min(prices),
             'close': prices[-1],  # Last price in the minute
-            'volume': sum(volumes),
-            'timestamp': datetime.now(),
-            'trade_count': len(trades),
-            'data_source': 'calculated_from_trades'
+            'volume': sum(volumes)
         }
 
-def get_market_summary(instrument_key="NSE_EQ|INE155A01022"):
+def get_market_summary(symbol="SUZLON"):
     """Get a summary of market data for the instrument."""
+    instrument_key = STOCKS[symbol]
+    instrument_key = "NSE_EQ|" + instrument_key
     with data_lock:
         if instrument_key not in market_data_store:
             return None
@@ -160,10 +160,12 @@ def get_market_summary(instrument_key="NSE_EQ|INE155A01022"):
         }
 
 
-async def fetch_market_data():
+async def fetch_market_data(symbol= "SUZLON"):
     """Fetch market data using WebSocket and print it."""
 
     # Create default SSL context
+    instrument_key = STOCKS[symbol]
+    instrument_key = "NSE_EQ|" + instrument_key  
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
@@ -172,7 +174,11 @@ async def fetch_market_data():
     response = get_market_data_feed_authorize_v3()
     # Connect to the WebSocket with SSL context
     print(response)
-    async with websockets.connect(response["data"]["authorized_redirect_uri"], ssl=ssl_context) as websocket:
+    headers = {
+    'Origin': 'https://api.upstox.com',
+    'User-Agent': 'Mozilla/5.0'
+}
+    async with websockets.connect(response["data"]["authorized_redirect_uri"], ssl=ssl_context, extra_headers=headers) as websocket:
         print('Connection established')
 
         await asyncio.sleep(1)  # Wait for 1 second
@@ -183,7 +189,7 @@ async def fetch_market_data():
             "method": "sub",
             "data": {
                 "mode": "full",
-                "instrumentKeys": ["NSE_EQ|INE155A01022"] # can add a list of instrument keys
+                "instrumentKeys": [instrument_key] # can add a list of instrument keys
             }
         }
 
@@ -204,5 +210,5 @@ async def fetch_market_data():
             # Print the dictionary representation
             # print(json.dumps(data_dict))
 
-# Execute the function to fetch market data
+# # Execute the function to fetch market data
 # asyncio.run(fetch_market_data())
