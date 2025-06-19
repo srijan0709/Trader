@@ -5,6 +5,9 @@ from tqdm import tqdm as tq
 import os
 from config import STOCKS
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import time
+import threading
 
 class StockDataFetcher:
     def __init__(self):
@@ -538,6 +541,32 @@ class UpstoxTrader():
         response = requests.get(url, headers=headers, params=params)
 
         return response.json()
+    
+    def exitAllPositions(self):
+        """
+        Exit all positions by selling them.
+        """
+        url = 'https://api.upstox.com/v2/order/positions/exit'
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}',
+        }
+
+        data = {}
+
+        try:
+            # Send the POST request
+            response = requests.post(url, json=data, headers=headers)
+            # Print the response status code and body
+            print('Response Code:', response.status_code)
+            print('Response Body:', response.json())
+
+        except Exception as e:
+            # Handle exceptions
+            print('Error:', str(e))
+            return None
+
         
 class TechnicalIndicatorWindow:
     def __init__(self, window_size=28):
@@ -590,3 +619,62 @@ class TechnicalIndicatorWindow:
 
         latest_features = df.iloc[-1]
         return latest_features
+
+class TradeMonitoringBot:
+    '''Class to monitor active orders and manage their execution status in a separate thread'''
+    def __init__(self,trader):
+        self.order_monitoring_thread = None
+        self.stop_monitoring = threading.Event()
+        self.active_orders = {}
+        self.trader = trader
+        
+    def monitor_orders(self, order_id):
+        """Run in separate thread to monitor order execution"""
+        while not self.stop_monitoring.is_set():
+            try:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    future_stat1 = executor.submit(self.trader.getOrderDetails, order_id['target_order'])
+                    future_stat2 = executor.submit(self.trader.getOrderDetails, order_id['stop_loss_order'])
+                    stat1 = future_stat1.result()
+                    stat2 = future_stat2.result()
+                
+                if stat1['data']['status'] == 'complete':
+                    self.trader.CancelOrder(order_id['stop_loss_order'])
+                    print("Target order executed, stop loss order cancelled.")
+                    self.active_orders.clear()
+                    break
+                elif stat2['data']['status'] == 'complete':
+                    self.trader.CancelOrder(order_id['target_order'])
+                    print("Stop loss order executed, target order cancelled.")
+                    self.active_orders.clear()
+                    break
+                    
+                time.sleep(5)  # Check every 5 seconds
+            except Exception as e:
+                self.active_orders.clear()
+                print(f"Error monitoring orders: {e}")
+                time.sleep(5)
+    
+    def start_order_monitoring(self, order_id):
+        """Start monitoring orders in background"""
+        if self.order_monitoring_thread and self.order_monitoring_thread.is_alive():
+            self.stop_monitoring.set()
+            self.order_monitoring_thread.join()
+        
+        self.stop_monitoring.clear()
+        self.active_orders = order_id.copy()
+        self.order_monitoring_thread = threading.Thread(target=self.monitor_orders, args=(order_id,))
+        self.order_monitoring_thread.daemon = True
+        self.order_monitoring_thread.start()
+    
+    def has_active_orders(self):
+        """Check if there are active orders being monitored"""
+        return bool(self.active_orders)
+    
+    def stop_order_monitoring(self):
+        """Stop monitoring thread gracefully"""
+        if self.order_monitoring_thread and self.order_monitoring_thread.is_alive():
+            self.stop_monitoring.set()
+            self.order_monitoring_thread.join()
+            self.active_orders.clear()
+            print("Stopped order monitoring.")
