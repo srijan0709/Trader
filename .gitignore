@@ -1,4 +1,4 @@
-trained_models/*
+Models/trained_models/*
 __pycache__
 .env
 json_files/*
