@@ -1,0 +1,11 @@
+torch
+requests
+numpy
+pytz
+pandas
+ta
+tqdm
+websockets
+google
+protobuf
+gym

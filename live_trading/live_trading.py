@@ -71,7 +71,8 @@ model_logger = loggers['model']
 system_logger = loggers['system']
 
 # Add parent directory to path
-parent_dir = os.path.abspath(os.path.join(os.getcwd(), ".."))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(script_dir, ".."))
 sys.path.append(parent_dir)
 
 # Import custom modules
