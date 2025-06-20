@@ -684,8 +684,8 @@ class TradeMonitoringBot:
             print("Stopped order monitoring.")
             
     def get_trade_stats(self):
-    """Return current count of trades that hit target or stop loss"""
-    return {
-        'target_hits': self.target_hits,
-        'stop_loss_hits': self.stop_loss_hits
-    }
+        """Return current count of trades that hit target or stop loss"""
+        return {
+            'target_hits': self.target_hits,
+            'stop_loss_hits': self.stop_loss_hits
+        }

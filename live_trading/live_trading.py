@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import pytz
+import argparse
 
 # Setup logging
 def setup_logging():
@@ -89,8 +90,10 @@ except ImportError as e:
 class TradingBot:
     """Main trading bot class"""
     
-    def __init__(self, symbol="SUZLON"):
+    def __init__(self, symbol="SUZLON", model_path=None, norm_path=None):
         self.symbol = symbol
+        self.model_path = model_path
+        self.norm_path = norm_path
         self.running = True
         self.ws_thread = None
         self.india_tz = pytz.timezone('Asia/Kolkata')
@@ -124,8 +127,9 @@ class TradingBot:
             self.policy_net.to(self.device)
             self.target_net.to(self.device)
             
-            model_path = r"C:\Users\srija\Assignment\Trading\Models\trained_models\suzlon_14_june\suzlon_14_june_2866.pth"
-            self.policy_net.load_state_dict(torch.load(model_path, map_location=self.device))
+            if self.model_path is None:
+                raise ValueError("Model path not provided.")
+            self.policy_net.load_state_dict(torch.load(self.model_path, map_location=self.device))
             self.policy_net.eval()
             
             model_logger.info("Model loaded successfully")
@@ -147,8 +151,9 @@ class TradingBot:
     def _load_normalization_params(self):
         """Load normalization parameters"""
         try:
-            norm_params_path = "C:/Users/srija/Assignment/Trading/json_files/suzlon_14_june_norm_params.json"
-            with open(norm_params_path, "r") as f:
+            if self.norm_path is None:
+                raise ValueError("Normalization params path not provided.")
+            with open(self.norm_path, "r") as f:
                 self.norm_params = json.load(f)
             system_logger.info("Normalization parameters loaded successfully")
         except Exception as e:
@@ -206,7 +211,9 @@ class TradingBot:
     def setup_csv_logging(self):
         """Setup CSV file for market data logging"""
         today = datetime.now(self.india_tz).date()
-        self.csv_path = Path(f'C:/Users/srija/Assignment/Trading/json_files/suzlon_{today}.csv')
+        norm_path = Path(self.norm_path) 
+        folder = norm_path.parent 
+        self.csv_path = folder / f"{self.symbol}_{today}.csv"
         trading_logger.info(f"CSV logging setup: {self.csv_path}")
     
     def log_market_data(self, new_bar):
@@ -421,8 +428,15 @@ class TradingBot:
 
 def main():
     """Main entry point"""
+    parser = argparse.ArgumentParser(description="Run trading bot for a specific symbol.")
+    parser.add_argument('--symbol', type=str, required=True, help='Stock symbol (e.g., SUZLON)')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to trained model (.pth)')
+    parser.add_argument('--norm_path', type=str, required=True, help='Path to normalization params (.json)')
+    
+    args = parser.parse_args()
+
     try:
-        bot = TradingBot(symbol="SUZLON")
+        bot = TradingBot(symbol=args.symbol, model_path=args.model_path, norm_path=args.norm_path)
         bot.run()
     except Exception as e:
         system_logger.error(f"Failed to start trading bot: {e}")
@@ -430,3 +444,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+## Example usage:
+# python trading_bot.py --symbol SUZLON \
+#     --model_path "C:/Users/srija/Assignment/Trading/Models/trained_models/suzlon_14_june/suzlon_14_june_2866.pth" \
+#     --norm_path "C:/Users/srija/Assignment/Trading/json_files/suzlon_14_june_norm_params.json"
