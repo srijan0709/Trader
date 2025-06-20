@@ -627,6 +627,8 @@ class TradeMonitoringBot:
         self.stop_monitoring = threading.Event()
         self.active_orders = {}
         self.trader = trader
+        self.target_hits = 0
+        self.stop_loss_hits = 0
         
     def monitor_orders(self, order_id):
         """Run in separate thread to monitor order execution"""
@@ -641,11 +643,13 @@ class TradeMonitoringBot:
                 if stat1['data']['status'] == 'complete':
                     self.trader.CancelOrder(order_id['stop_loss_order'])
                     print("Target order executed, stop loss order cancelled.")
+                    self.target_hits += 1
                     self.active_orders.clear()
                     break
                 elif stat2['data']['status'] == 'complete':
                     self.trader.CancelOrder(order_id['target_order'])
                     print("Stop loss order executed, target order cancelled.")
+                    self.stop_loss_hits += 1
                     self.active_orders.clear()
                     break
                     
@@ -678,3 +682,10 @@ class TradeMonitoringBot:
             self.order_monitoring_thread.join()
             self.active_orders.clear()
             print("Stopped order monitoring.")
+            
+    def get_trade_stats(self):
+    """Return current count of trades that hit target or stop loss"""
+    return {
+        'target_hits': self.target_hits,
+        'stop_loss_hits': self.stop_loss_hits
+    }

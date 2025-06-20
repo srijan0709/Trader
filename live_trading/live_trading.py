@@ -400,6 +400,11 @@ class TradingBot:
                 iteration_time = time.time() - iteration_start
                 trading_logger.info(f"Iteration {iteration_count} completed in {iteration_time:.2f}s")
                 
+                trade_stats = self.bot.get_trade_stats()
+                if trade_stats['target_hits'] > 1 or trade_stats['stop_loss_hits'] > 0:
+                    orders_logger.info(f"Trade Stats - Target Hits: {trade_stats['target_hits']}, Stop Loss Hits: {trade_stats['stop_loss_hits']}")
+                    break
+                    
                 # Wait for next minute
                 next_minute = (datetime.now(self.india_tz) + timedelta(minutes=1)).replace(second=0, microsecond=0)
                 while datetime.now(self.india_tz) < next_minute and self.running:
