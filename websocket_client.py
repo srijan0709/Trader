@@ -13,6 +13,9 @@ from datetime import datetime, timedelta
 market_data_store = {}
 data_lock = threading.Lock()
 from config import STOCKS
+import pytz
+
+india_tz = pytz.timezone('Asia/Kolkata')
 
 def get_market_data_feed_authorize_v3():
     """Get authorization for market data feed."""
@@ -134,7 +137,7 @@ def get_latest_ohlc_volume(symbol="SUZLON"):
             return None
         
         return {
-            'timestamp': datetime.now(),
+            'timestamp':  datetime.now(india_tz),
             'open': prices[0],  # First price in the minute
             'high': max(prices),
             'low': min(prices),

@@ -13,6 +13,8 @@ import threading
 import time
 from collections import deque
 import copy
+import multiprocessing
+import pickle
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(script_dir, ".."))
@@ -24,7 +26,7 @@ class SharedReplayBuffer:
     def __init__(self, capacity: int):
         self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
-        self.lock = threading.Lock()
+        self.lock = multiprocessing.Lock()
     
     def push(self, state, action, reward, next_state, done):
         """Add experience to buffer."""
@@ -43,6 +45,311 @@ class SharedReplayBuffer:
     def __len__(self):
         with self.lock:
             return len(self.buffer)
+
+def worker_process_function(worker_id: int, 
+                          episode_queue: Queue, 
+                          result_queue: Queue,
+                          df_normalized_path: str,
+                          target_buy_path: str,
+                          target_sell_path: str,
+                          shared_state_dict: dict,
+                          device: str):
+    """
+    Standalone worker process function (not bound to class instance).
+    
+    Args:
+        worker_id: Unique identifier for the worker
+        episode_queue: Queue to receive episode assignments
+        result_queue: Queue to send results back
+        df_normalized_path: Path to normalized dataframe
+        target_buy_path: Path to buy target data
+        target_sell_path: Path to sell target data
+        shared_state_dict: Initial network state dictionary
+        device: Device to use (cpu/cuda)
+    """
+    print(f"Worker {worker_id} started")
+    
+    try:
+        # Load data in worker process
+        df_normalized = pd.read_pickle(df_normalized_path)
+        target_buy = pd.read_pickle(target_buy_path)
+        target_sell = pd.read_pickle(target_sell_path)
+        
+        # Initialize worker's local network
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+        from Models.DQN import DQN, DQNAgent
+        from trading_environment import StockTradingEnv
+        
+        # Force CPU for all workers to avoid device mismatch
+        worker_device = 'cpu'
+        
+        local_policy_net = DQN(16, 3)
+        local_policy_net.load_state_dict(shared_state_dict)
+        local_policy_net.to(worker_device)
+        local_policy_net.eval()  # Workers only do inference
+        
+        # Create environment and agent
+        env = StockTradingEnv(df_normalized)
+        agent = DQNAgent(env, local_policy_net, local_policy_net)
+
+        # Ensure agent uses correct device
+        if hasattr(agent, 'device'):
+            agent.device = worker_device
+        
+        while True:
+            try:
+                # Get episode assignment
+                episode_data = episode_queue.get(timeout=5)
+                if episode_data is None:  # Shutdown signal
+                    break
+
+                # Set epsilon if passed
+                epsilon_value = episode_data.get('epsilon', 1.0)
+                agent.epsilon = epsilon_value
+                
+                episode_num = episode_data['episode']
+                network_state = episode_data.get('network_state')
+                
+                # Update local network if new state provided
+                if network_state:
+                    # Ensure state dict is on correct device
+                    state_dict_cpu = {}
+                    for k, v in network_state.items():
+                        if torch.is_tensor(v):
+                            state_dict_cpu[k] = v.to('cpu')
+                        else:
+                            state_dict_cpu[k] = v
+                    local_policy_net.load_state_dict(state_dict_cpu)
+                
+                # Run episode
+                episode_stats = run_worker_episode(
+                    agent, worker_id, episode_num, 
+                    df_normalized, target_buy, target_sell, worker_device
+                )
+                
+                # Send results back
+                result_queue.put({
+                    'worker_id': worker_id,
+                    'episode': episode_num,
+                    'stats': episode_stats
+                })
+                
+            except Exception as e:
+                print(f"Worker {worker_id} episode error: {e}")
+                continue
+                
+    except Exception as e:
+        print(f"Worker {worker_id} initialization error: {e}")
+        return
+    
+    print(f"Worker {worker_id} terminated")
+
+def get_state(df: pd.DataFrame, current_step: int) -> np.ndarray:
+    """Extract state features from dataframe at given step."""
+    row = df.iloc[current_step]
+    state = np.array([
+        row['time'],
+        row['open'],
+        row['high'],
+        row['low'],
+        row['close'],
+        row['volume'],
+        row['MA50'],
+        row['RSI'],
+        row['MACD'],
+        row['BB_upper'],
+        row['BB_lower'],
+        row['ADX'],
+        row['CCI'],
+        row['ATR'],
+        row['ROC'],
+        row['OBV']
+    ], dtype=np.float32)
+    return state
+
+def calculate_optimized_scalping_reward(delay: float, 
+                                     action_type: str, 
+                                     success_base_reward: float = 1500,
+                                     failure_base_penalty: float = 1000, 
+                                     min_delay_threshold: float = 60,
+                                     max_reward: float = 2500, 
+                                     decay_rate: float = 0.3,
+                                     opportunity_cost_factor: float = 0.2,
+                                     missed_opp_multiplier: float = 2.0,
+                                     consecutive_successes: int = 0,
+                                     consecutive_success_bonus: float = 0.15) -> float:
+    """Comprehensive reward function optimized for scalping."""
+    delay = delay / 60  # Convert to minutes
+    
+    if action_type == 'success':
+        if delay <= min_delay_threshold:
+            base_reward = max_reward - (max_reward - success_base_reward) * (delay / min_delay_threshold)
+        else:
+            base_reward = success_base_reward
+        
+        reward = base_reward * np.exp(-decay_rate * delay)
+        opportunity_cost = opportunity_cost_factor * delay * success_base_reward
+        opportunity_cost = min(opportunity_cost, reward * 0.8)
+        reward = reward - opportunity_cost
+        
+        if consecutive_successes > 0:
+            sequential_bonus = reward * (consecutive_success_bonus * consecutive_successes)
+            reward += sequential_bonus
+        
+        return reward
+    
+    elif action_type == 'failure':
+        penalty = -failure_base_penalty * np.exp(-decay_rate * delay)
+        opportunity_cost = opportunity_cost_factor * delay * failure_base_penalty
+        penalty = penalty - opportunity_cost
+        return penalty
+    
+    elif action_type == 'missed_opportunity':
+        missed_penalty = -failure_base_penalty * missed_opp_multiplier * np.exp(-decay_rate * delay)
+        return missed_penalty
+    
+    elif action_type == 'no_action':
+        return 100
+    
+    return 0
+
+def run_worker_episode(agent, worker_id: int, episode: int, 
+                      df_normalized, target_buy, target_sell, device: str) -> Dict[str, Any]:
+    """Run a single episode in a worker process."""
+    total_reward = 0
+    number_trans = 0
+    wins = 0
+    lose = 0
+    defeat = 0
+    consecutive_success = 0
+    
+    step = 0
+    experiences = []  # Collect experiences for batch upload to replay buffer
+    
+    while step < len(df_normalized):
+        state = get_state(df_normalized, step)
+        
+        # Ensure state is on correct device for agent
+        if hasattr(agent, 'select_action'):
+            action = agent.select_action(state)
+        else:
+            # Fallback if agent doesn't have proper device handling
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                q_values = agent.policy_net(state_tensor)
+                action = q_values.max(1)[1].item()
+        
+        done = False
+        reward = 0
+        
+        if action == 1:  # BUY
+            next_state = target_buy.iloc[step]
+            next_state_index = next_state["next_state_index"]
+            next_state2 = df_normalized.iloc[next_state_index].copy()
+            
+            if next_state['action'] == "Target Hit":
+                wins += 1
+                consecutive_success += 1
+                reward = calculate_optimized_scalping_reward(
+                    delay=target_buy.iloc[step]['delay'],
+                    action_type="success",
+                    consecutive_successes=consecutive_success
+                )
+            elif next_state['action'] == "Stop Loss Hit":
+                defeat += 1
+                consecutive_success = 0
+                reward = calculate_optimized_scalping_reward(
+                    delay=target_buy.iloc[step]['delay'],
+                    action_type="failure"
+                )
+            elif next_state['action'] == "End of Day":
+                lose += 1
+                consecutive_success = 0
+                done = True
+                reward = calculate_optimized_scalping_reward(
+                    delay=target_buy.iloc[step]['delay'],
+                    action_type="failure"
+                )
+            
+            next_state2 = np.array(next_state2.values, dtype=np.float32)
+            experiences.append((state, action, float(reward), next_state2, done))
+            number_trans += 1
+            step = next_state_index + 1
+            
+        elif action == 2:  # SELL
+            next_state = target_sell.iloc[step]
+            next_state_index = next_state["next_state_index"]
+            next_state2 = df_normalized.iloc[next_state_index].copy()
+            
+            if next_state['action'] == "Target Hit":
+                wins += 1
+                consecutive_success += 1
+                reward = calculate_optimized_scalping_reward(
+                    delay=target_sell.iloc[step]['delay'],
+                    action_type="success",
+                    consecutive_successes=consecutive_success
+                )
+            elif next_state['action'] == "Stop Loss Hit":
+                consecutive_success = 0
+                defeat += 1
+                reward = calculate_optimized_scalping_reward(
+                    delay=target_sell.iloc[step]['delay'],
+                    action_type="failure"
+                )
+            elif next_state['action'] == "End of Day":
+                consecutive_success = 0
+                lose += 1
+                done = True
+                reward = calculate_optimized_scalping_reward(
+                    delay=target_sell.iloc[step]['delay'],
+                    action_type="failure"
+                )
+            
+            next_state2 = np.array(next_state2.values, dtype=np.float32)
+            experiences.append((state, action, float(reward), next_state2, done))
+            number_trans += 1
+            step = next_state_index + 1
+            
+        elif action == 0:  # HOLD
+            buy_side = target_buy.iloc[step]
+            sell_side = target_sell.iloc[step]
+            
+            if buy_side['action'] == "Target Hit":
+                reward = calculate_optimized_scalping_reward(
+                    delay=target_buy.iloc[step]['delay'],
+                    action_type="missed_opportunity"
+                )
+            elif sell_side['action'] == "Target Hit":
+                reward = calculate_optimized_scalping_reward(
+                    delay=target_sell.iloc[step]['delay'],
+                    action_type="missed_opportunity"
+                )
+            else:
+                reward = 100
+            
+            if step + 1 < len(df_normalized):
+                next_state = get_state(df_normalized, step + 1)
+            else:
+                done = True
+                next_state = get_state(df_normalized, -1)
+            
+            experiences.append((state, action, float(reward), next_state, done))
+            step = step + 1
+        
+        total_reward += reward
+    
+    return {
+        'episode': episode,
+        'worker_id': worker_id,
+        'total_reward': total_reward,
+        'number_trans': number_trans,
+        'wins': wins,
+        'lose': lose,
+        'defeat': defeat,
+        'win_rate': wins / max(number_trans, 1) * 100,
+        'experiences_collected': len(experiences),
+        'experiences': experiences 
+    }
 
 class ParallelDQNTradingTrainer:
     """
@@ -102,13 +409,14 @@ class ParallelDQNTradingTrainer:
         self.weights_folder = os.path.join(self.save_folder, "model_weights")
         self.stats_csv = os.path.join(self.save_folder, f"model_stats/{symbol}_{start_date}_stats.csv")
         
-        # Set device
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        # Force CPU for multiprocessing compatibility
+        self.device = 'cpu'
         
         # Create save directory
         os.makedirs(self.save_folder, exist_ok=True)
         os.makedirs(os.path.dirname(self.norm_params_path), exist_ok=True)
         os.makedirs(self.weights_folder, exist_ok=True)
+        os.makedirs(os.path.dirname(self.stats_csv), exist_ok=True)
         
         # Initialize data containers
         self.df = None
@@ -123,16 +431,12 @@ class ParallelDQNTradingTrainer:
         self.optimizer = None
         self.shared_replay_buffer = SharedReplayBuffer(replay_buffer_size)
         
-        # Multiprocessing components
-        self.manager = Manager()
-        self.worker_queues = []
-        self.result_queue = Queue()
-        self.workers = []
-        self.episode_counter = self.manager.Value('i', 0)
-        self.global_step = self.manager.Value('i', 0)
-        
         # Training statistics
         self.training_stats = []
+        
+        # Temporary file paths for worker data
+        self.temp_dir = os.path.join(self.save_folder, "temp")
+        os.makedirs(self.temp_dir, exist_ok=True)
         
     def load_data(self, additional_csv_path: str = None) -> pd.DataFrame:
         """Load and prepare stock data (same as original)."""
@@ -216,268 +520,31 @@ class ParallelDQNTradingTrainer:
         
         if self.model_path and os.path.exists(self.model_path):
             print(f"Loading pre-trained model from {self.model_path}")
-            self.policy_net.load_state_dict(torch.load(self.model_path))
+            self.policy_net.load_state_dict(torch.load(self.model_path, map_location='cpu'))
         
-        self.policy_net.to(self.device)
-        self.target_net.to(self.device)
+        # Keep models on CPU for multiprocessing
+        # self.policy_net.to('cpu')
+        # self.target_net.to('cpu')
+        self.device2 = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.policy_net.to(self.device2)
+        self.target_net.to(self.device2)
         
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=0.001)
         
-        print(f"Models initialized on device: {self.device}")
-    
-    def get_state(self, df: pd.DataFrame, current_step: int) -> np.ndarray:
-        """Extract state features from dataframe at given step."""
-        row = df.iloc[current_step]
-        state = np.array([
-            row['time'],
-            row['open'],
-            row['high'],
-            row['low'],
-            row['close'],
-            row['volume'],
-            row['MA50'],
-            row['RSI'],
-            row['MACD'],
-            row['BB_upper'],
-            row['BB_lower'],
-            row['ADX'],
-            row['CCI'],
-            row['ATR'],
-            row['ROC'],
-            row['OBV']
-        ], dtype=np.float32)
-        return state
-    
-    def calculate_optimized_scalping_reward(self, 
-                                         delay: float, 
-                                         action_type: str, 
-                                         success_base_reward: float = 1500,
-                                         failure_base_penalty: float = 1000, 
-                                         min_delay_threshold: float = 60,
-                                         max_reward: float = 2500, 
-                                         decay_rate: float = 0.3,
-                                         opportunity_cost_factor: float = 0.2,
-                                         missed_opp_multiplier: float = 2.0,
-                                         consecutive_successes: int = 0,
-                                         consecutive_success_bonus: float = 0.15) -> float:
-        """Comprehensive reward function optimized for scalping."""
-        delay = delay / 60  # Convert to minutes
+        print(f"Models initialized on device: {self.device2}")
         
-        if action_type == 'success':
-            if delay <= min_delay_threshold:
-                base_reward = max_reward - (max_reward - success_base_reward) * (delay / min_delay_threshold)
-            else:
-                base_reward = success_base_reward
-            
-            reward = base_reward * np.exp(-decay_rate * delay)
-            opportunity_cost = opportunity_cost_factor * delay * success_base_reward
-            opportunity_cost = min(opportunity_cost, reward * 0.8)
-            reward = reward - opportunity_cost
-            
-            if consecutive_successes > 0:
-                sequential_bonus = reward * (consecutive_success_bonus * consecutive_successes)
-                reward += sequential_bonus
-            
-            return reward
+    def save_worker_data(self):
+        """Save data files for worker processes."""
+        df_normalized_path = os.path.join(self.temp_dir, "df_normalized.pkl")
+        target_buy_path = os.path.join(self.temp_dir, "target_buy.pkl")
+        target_sell_path = os.path.join(self.temp_dir, "target_sell.pkl")
         
-        elif action_type == 'failure':
-            penalty = -failure_base_penalty * np.exp(-decay_rate * delay)
-            opportunity_cost = opportunity_cost_factor * delay * failure_base_penalty
-            penalty = penalty - opportunity_cost
-            return penalty
+        self.df_normalized.to_pickle(df_normalized_path)
+        self.target_buy.to_pickle(target_buy_path)
+        self.target_sell.to_pickle(target_sell_path)
         
-        elif action_type == 'missed_opportunity':
-            missed_penalty = -failure_base_penalty * missed_opp_multiplier * np.exp(-decay_rate * delay)
-            return missed_penalty
-        
-        elif action_type == 'no_action':
-            return 100
-        
-        return 0
-    
-    def worker_process(self, worker_id: int, shared_state_dict: dict, episode_queue: Queue):
-        """
-        Worker process for parallel episode execution.
-        
-        Args:
-            worker_id: Unique identifier for the worker
-            shared_state_dict: Shared network state dictionary
-            episode_queue: Queue to receive episode assignments
-        """
-        print(f"Worker {worker_id} started")
-        
-        # Initialize worker's local network
-        from Models.DQN import DQN, DQNAgent
-        from trading_environment import StockTradingEnv
-        
-        local_policy_net = DQN(16, 3)
-        local_policy_net.load_state_dict(shared_state_dict)
-        local_policy_net.eval()  # Workers only do inference
-        
-        env = StockTradingEnv(self.df_normalized)
-        agent = DQNAgent(env, local_policy_net, local_policy_net)
-        agent.epsilon = max(0.1, 1.0 - worker_id * 0.1)  # Different exploration rates per worker
-        
-        while True:
-            try:
-                # Get episode assignment
-                episode_data = episode_queue.get(timeout=1)
-                if episode_data is None:  # Shutdown signal
-                    break
-                
-                episode_num = episode_data['episode']
-                network_state = episode_data.get('network_state')
-                
-                # Update local network if new state provided
-                if network_state:
-                    local_policy_net.load_state_dict(network_state)
-                
-                # Run episode
-                episode_stats = self.run_worker_episode(agent, worker_id, episode_num)
-                
-                # Send results back
-                self.result_queue.put({
-                    'worker_id': worker_id,
-                    'episode': episode_num,
-                    'stats': episode_stats
-                })
-                
-            except Exception as e:
-                print(f"Worker {worker_id} error: {e}")
-                break
-        
-        print(f"Worker {worker_id} terminated")
-    
-    def run_worker_episode(self, agent, worker_id: int, episode: int) -> Dict[str, Any]:
-        """Run a single episode in a worker process."""
-        total_reward = 0
-        number_trans = 0
-        wins = 0
-        lose = 0
-        defeat = 0
-        consecutive_success = 0
-        
-        step = 0
-        experiences = []  # Collect experiences for batch upload to replay buffer
-        
-        while step < len(self.df_normalized):
-            state = self.get_state(self.df_normalized, step)
-            action = agent.select_action(state)
-            done = False
-            reward = 0
-            
-            if action == 1:  # BUY
-                next_state = self.target_buy.iloc[step]
-                next_state_index = next_state["next_state_index"]
-                next_state2 = self.df_normalized.iloc[next_state_index].copy()
-                
-                if next_state['action'] == "Target Hit":
-                    wins += 1
-                    consecutive_success += 1
-                    reward = self.calculate_optimized_scalping_reward(
-                        delay=self.target_buy.iloc[step]['delay'],
-                        action_type="success",
-                        consecutive_successes=consecutive_success
-                    )
-                elif next_state['action'] == "Stop Loss Hit":
-                    defeat += 1
-                    consecutive_success = 0
-                    reward = self.calculate_optimized_scalping_reward(
-                        delay=self.target_buy.iloc[step]['delay'],
-                        action_type="failure"
-                    )
-                elif next_state['action'] == "End of Day":
-                    lose += 1
-                    consecutive_success = 0
-                    done = True
-                    reward = self.calculate_optimized_scalping_reward(
-                        delay=self.target_buy.iloc[step]['delay'],
-                        action_type="failure"
-                    )
-                
-                next_state2 = np.array(next_state2.values, dtype=np.float32)
-                experiences.append((state, action, float(reward), next_state2, done))
-                number_trans += 1
-                step = next_state_index + 1
-                
-            elif action == 2:  # SELL
-                next_state = self.target_sell.iloc[step]
-                next_state_index = next_state["next_state_index"]
-                next_state2 = self.df_normalized.iloc[next_state_index].copy()
-                
-                if next_state['action'] == "Target Hit":
-                    wins += 1
-                    consecutive_success += 1
-                    reward = self.calculate_optimized_scalping_reward(
-                        delay=self.target_sell.iloc[step]['delay'],
-                        action_type="success",
-                        consecutive_successes=consecutive_success
-                    )
-                elif next_state['action'] == "Stop Loss Hit":
-                    consecutive_success = 0
-                    defeat += 1
-                    reward = self.calculate_optimized_scalping_reward(
-                        delay=self.target_sell.iloc[step]['delay'],
-                        action_type="failure"
-                    )
-                elif next_state['action'] == "End of Day":
-                    consecutive_success = 0
-                    lose += 1
-                    done = True
-                    reward = self.calculate_optimized_scalping_reward(
-                        delay=self.target_sell.iloc[step]['delay'],
-                        action_type="failure"
-                    )
-                
-                next_state2 = np.array(next_state2.values, dtype=np.float32)
-                experiences.append((state, action, float(reward), next_state2, done))
-                number_trans += 1
-                step = next_state_index + 1
-                
-            elif action == 0:  # HOLD
-                buy_side = self.target_buy.iloc[step]
-                sell_side = self.target_sell.iloc[step]
-                
-                if buy_side['action'] == "Target Hit":
-                    reward = self.calculate_optimized_scalping_reward(
-                        delay=self.target_buy.iloc[step]['delay'],
-                        action_type="missed_opportunity"
-                    )
-                elif sell_side['action'] == "Target Hit":
-                    reward = self.calculate_optimized_scalping_reward(
-                        delay=self.target_sell.iloc[step]['delay'],
-                        action_type="missed_opportunity"
-                    )
-                else:
-                    reward = 100
-                
-                if step + 1 < len(self.df_normalized):
-                    next_state = self.get_state(self.df_normalized, step + 1)
-                else:
-                    done = True
-                    next_state = self.get_state(self.df_normalized, -1)
-                
-                experiences.append((state, action, float(reward), next_state, done))
-                step = step + 1
-            
-            total_reward += reward
-        
-        # Batch upload all experiences to shared replay buffer
-        for exp in experiences:
-            self.shared_replay_buffer.push(*exp)
-        
-        return {
-            'episode': episode,
-            'worker_id': worker_id,
-            'total_reward': total_reward,
-            'number_trans': number_trans,
-            'wins': wins,
-            'lose': lose,
-            'defeat': defeat,
-            'win_rate': wins / max(number_trans, 1) * 100,
-            'experiences_collected': len(experiences)
-        }
+        return df_normalized_path, target_buy_path, target_sell_path
     
     def update_policy_async(self):
         """Asynchronous policy update using shared replay buffer."""
@@ -489,12 +556,13 @@ class ParallelDQNTradingTrainer:
         if batch is None:
             return False
         
-        # Convert batch to tensors
-        states = torch.FloatTensor([exp[0] for exp in batch]).to(self.device)
-        actions = torch.LongTensor([exp[1] for exp in batch]).to(self.device)
-        rewards = torch.FloatTensor([exp[2] for exp in batch]).to(self.device)
-        next_states = torch.FloatTensor([exp[3] for exp in batch]).to(self.device)
-        dones = torch.BoolTensor([exp[4] for exp in batch]).to(self.device)
+        # Convert batch to tensors (ensure all on CPU)
+        # states = torch.FloatTensor([exp[0] for exp in batch]).to('cpu')
+        states = torch.FloatTensor([...]).to(self.device2)
+        actions = torch.LongTensor([exp[1] for exp in batch]).to('cpu')
+        rewards = torch.FloatTensor([exp[2] for exp in batch]).to('cpu')
+        next_states = torch.FloatTensor([exp[3] for exp in batch]).to('cpu')
+        dones = torch.BoolTensor([exp[4] for exp in batch]).to('cpu')
         
         # Compute Q-values
         current_q_values = self.policy_net(states).gather(1, actions.unsqueeze(1))
@@ -510,122 +578,169 @@ class ParallelDQNTradingTrainer:
         
         return True
     
-    def train_parallel(self, start_episode: int = 0, save_frequency: int = 5):
+    def train_parallel(self, start_episode: int = 0, save_frequency: int = 50):
         """
         Main parallel training loop.
-        
+
         Args:
             start_episode: Episode to start training from
             save_frequency: Frequency of model saving
         """
         print(f"Starting parallel training with {self.num_workers} workers")
         print(f"Total episodes: {self.num_epochs}")
-        
-        # Initialize episode queue for workers
+        print(f"Device: {self.device}")
+
+        # Save worker data
+        df_normalized_path, target_buy_path, target_sell_path = self.save_worker_data()
+
+        # Initialize queues
         episode_queue = Queue()
-        
+        result_queue = Queue()
+
         # Start worker processes
+        workers = []
         for worker_id in range(self.num_workers):
             worker = Process(
-                target=self.worker_process,
-                args=(worker_id, self.policy_net.state_dict(), episode_queue)
+                target=worker_process_function,
+                args=(
+                    worker_id,
+                    episode_queue,
+                    result_queue,
+                    df_normalized_path,
+                    target_buy_path,
+                    target_sell_path,
+                    self.policy_net.state_dict(),
+                    self.device
+                )
             )
             worker.start()
-            self.workers.append(worker)
-        
+            workers.append(worker)
+
         # Training loop
         episodes_completed = start_episode
         episodes_assigned = start_episode
         update_counter = 0
-        
+
+        # Per-worker epsilon tracking
+        worker_episode_counts = {i: 0 for i in range(self.num_workers)}
+        worker_epsilons = {
+            i: 1.0 - (i / max(1, self.num_workers - 1)) * 0.9  # From 1.0 to 0.1
+            for i in range(self.num_workers)
+        }
+        min_epsilon = 0.05
+        decay_rate = 0.995
+
         # Create progress bar
         pbar = tqdm(total=self.num_epochs, initial=start_episode, desc="Training Progress")
-        
+
         try:
             # Assign initial episodes to workers
-            for _ in range(min(self.num_workers * 2, self.num_epochs - episodes_assigned)):
-                episode_queue.put({'episode': episodes_assigned})
+            for worker_id in range(self.num_workers):
+                if episodes_assigned >= self.num_epochs:
+                    break
+                initial_eps = worker_epsilons[worker_id]
+                episode_queue.put({
+                    'episode': episodes_assigned,
+                    'network_state': None,
+                    'epsilon': initial_eps
+                })
                 episodes_assigned += 1
-            
+
             while episodes_completed < self.num_epochs:
-                # Process completed episodes
                 try:
-                    result = self.result_queue.get(timeout=1)
+                    result = result_queue.get(timeout=1)
                     episodes_completed += 1
                     pbar.update(1)
-                    
+
+                    worker_id = result['worker_id']
+                    worker_episode_counts[worker_id] += 1
+
                     # Store statistics
                     episode_stats = result['stats']
                     self.training_stats.append(episode_stats)
-                    
+
+                    # Push experiences to replay buffer
+                    for exp in result.get('experiences', []):
+                        self.shared_replay_buffer.push(*exp)
+
                     # Save episode statistics
                     episode_df = pd.DataFrame([episode_stats])
+                    episode_df = episode_df.drop(columns=['experiences', 'experiences_collected'])
                     if not os.path.exists(self.stats_csv):
                         episode_df.to_csv(self.stats_csv, index=False)
                     else:
                         episode_df.to_csv(self.stats_csv, mode='a', index=False, header=False)
-                    
+
                     # Assign new episode if available
                     if episodes_assigned < self.num_epochs:
-                        # Periodically send updated network weights to workers
+                        # Sync weights periodically
                         network_state = None
                         if episodes_assigned % self.sync_frequency == 0:
-                            network_state = self.policy_net.state_dict()
-                        
+                            network_state = {
+                                k: v.to('cpu') if torch.is_tensor(v) else v
+                                for k, v in self.policy_net.state_dict().items()
+                            }
+
+                        # Decay epsilon for this worker
+                        initial_eps = worker_epsilons[worker_id]
+                        decayed_eps = max(min_epsilon, initial_eps * (decay_rate ** worker_episode_counts[worker_id]))
+
                         episode_queue.put({
                             'episode': episodes_assigned,
-                            'network_state': network_state
+                            'network_state': network_state,
+                            'epsilon': decayed_eps
                         })
+                        print(f"Assigned episode {episodes_assigned} to worker {worker_id} with epsilon {decayed_eps:.4f}")
                         episodes_assigned += 1
-                    
-                    # Perform asynchronous policy updates
+
+                    # Policy update
                     if update_counter % self.update_frequency == 0:
                         if self.update_policy_async():
                             update_counter = 0
                     update_counter += 1
-                    
-                    # Update target network and save model periodically
+
+                    # Save periodically
                     if episodes_completed % save_frequency == 0:
                         self.target_net.load_state_dict(self.policy_net.state_dict())
-                        
-                        # Save model
+
                         model_save_path = os.path.join(
                             self.weights_folder,
                             f'{self.symbol.lower()}_{self.start_date.replace("-", "_")}_{episodes_completed}.pth'
                         )
                         torch.save(self.policy_net.state_dict(), model_save_path)
-                        
-                        # Print statistics for recent episodes
+
                         recent_stats = self.training_stats[-save_frequency:]
                         avg_reward = np.mean([s['total_reward'] for s in recent_stats])
                         avg_win_rate = np.mean([s['win_rate'] for s in recent_stats])
                         avg_trans = np.mean([s['number_trans'] for s in recent_stats])
-                        
+
                         print(f"\nEpisode {episodes_completed}/{self.num_epochs}")
                         print(f"Avg Reward (last {save_frequency}): {avg_reward:.2f}")
                         print(f"Avg Win Rate (last {save_frequency}): {avg_win_rate:.2f}%")
                         print(f"Avg Transactions (last {save_frequency}): {avg_trans:.1f}")
                         print(f"Replay Buffer Size: {len(self.shared_replay_buffer)}")
                         print(f"Model saved to: {model_save_path}")
-                
+
                 except:
-                    # Continue if no results available
                     time.sleep(0.01)
                     continue
-        
+
         finally:
             pbar.close()
-            
-            # Shutdown workers
             print("Shutting down workers...")
             for _ in range(self.num_workers):
-                episode_queue.put(None)  # Shutdown signal
-            
-            for worker in self.workers:
+                episode_queue.put(None)
+            for worker in workers:
                 worker.join(timeout=5)
                 if worker.is_alive():
                     worker.terminate()
-    
+            try:
+                os.remove(df_normalized_path)
+                os.remove(target_buy_path)
+                os.remove(target_sell_path)
+            except:
+                pass
+
     def run_full_training_pipeline(self, additional_csv_path: str = None, start_episode: int = 0):
         """Run the complete parallel training pipeline."""
         print(f"Starting parallel training pipeline for {self.symbol}")
@@ -673,7 +788,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for updates")
     parser.add_argument("--update_frequency", type=int, default=4, help="Policy update frequency")
     parser.add_argument("--sync_frequency", type=int, default=10, help="Network sync frequency")
-    
+
     args = parser.parse_args()
 
     trainer = ParallelDQNTradingTrainer(

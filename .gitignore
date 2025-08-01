@@ -1,5 +1,6 @@
-Models/trained_models/
-__pycache__
+Training_Strategies/trained_models/
+Training_Strategies/trained_models/json_files
+__pycache__/
 .env
 json_files
 venv

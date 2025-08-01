@@ -7,13 +7,14 @@ import torch
 import pandas as pd
 from typing import Tuple, Dict, Any, Optional
 import argparse
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(script_dir, ".."))
 sys.path.append(parent_dir)
 
-class DQNTradingTrainer:
+class PPOTradingTrainer:
     """
-    A comprehensive trainer class for DQN-based stock trading models.
+    A comprehensive trainer class for PPO-based stock trading models.
     
     This class handles the entire training pipeline including:
     - Data fetching and preprocessing
@@ -30,11 +31,13 @@ class DQNTradingTrainer:
                  stop_loss: float = 0.99,
                  num_epochs: int = 3000,
                  save_folder: str = None,
-                 model_path: str = None,
+                 actor_model_path: str = None,
+                 critic_model_path: str = None,
                  norm_params_path: str = None,
-                 device: str = None):
+                 device: str = None,
+                 update_frequency: int = 2048):  # PPO update frequency
         """
-        Initialize the DQN Trading Trainer.
+        Initialize the PPO Trading Trainer.
         
         Args:
             symbol: Stock symbol to trade (e.g., 'SUZLON')
@@ -44,9 +47,11 @@ class DQNTradingTrainer:
             stop_loss: Stop loss multiplier for buy side (default: 0.99 = 1% loss)
             num_epochs: Number of training episodes
             save_folder: Folder to save trained models
-            model_path: Path to pre-trained model (optional)
+            actor_model_path: Path to pre-trained actor model (optional)
+            critic_model_path: Path to pre-trained critic model (optional)
             norm_params_path: Path to save normalization parameters
             device: Device to use for training ('cuda' or 'cpu')
+            update_frequency: How often to update PPO policy (in steps)
         """
         self.symbol = symbol
         self.start_date = start_date
@@ -54,21 +59,25 @@ class DQNTradingTrainer:
         self.target_profit = target_profit
         self.stop_loss = stop_loss
         self.num_epochs = num_epochs
+        self.update_frequency = update_frequency
         
         # Set up paths
         self.save_folder = save_folder or f"./trained_models/{symbol.lower()}_{start_date.replace('-', '_')}"
-        self.model_path = model_path
+        self.actor_model_path = actor_model_path
+        self.critic_model_path = critic_model_path
         self.norm_params_path = norm_params_path or f"./json_files/{symbol.lower()}_{start_date.replace('-', '_')}_norm_params.json"
         self.weights_folder = os.path.join(self.save_folder, "model_weights")
         self.stats_csv = os.path.join(self.save_folder, f"model_stats/{symbol}_{start_date}_stats.csv")
+        
         # Set device
-        # self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.device = 'cpu'
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Training will use device: {self.device}")
+        
         # Create save directory
         os.makedirs(self.save_folder, exist_ok=True)
         os.makedirs(os.path.dirname(self.norm_params_path), exist_ok=True)
         os.makedirs(self.weights_folder, exist_ok=True)
-        
+        os.makedirs(os.path.dirname(self.stats_csv), exist_ok=True)
         
         # Initialize data containers
         self.df = None
@@ -78,10 +87,11 @@ class DQNTradingTrainer:
         self.target_sell = None
         
         # Initialize models
-        self.policy_net = None
-        self.target_net = None
         self.agent = None
         self.env = None
+        
+        # PPO specific counters
+        self.step_count = 0
         
     def load_data(self, additional_csv_path: str = None) -> pd.DataFrame:
         """
@@ -175,32 +185,36 @@ class DQNTradingTrainer:
         
     def initialize_models(self):
         """
-        Initialize DQN models and training environment.
+        Initialize PPO models and training environment.
         """
-        print("Initializing models...")
-        from Models.DQN import DQN, DQNAgent
+        print("Initializing PPO models...")
+        from Models.PPO import PPOAgent  # Import your PPO implementation
         from trading_environment import StockTradingEnv
         
-        # Initialize networks
-        self.policy_net = DQN(16, 3)  # 16 features, 3 actions (hold, buy, sell)
-        self.target_net = DQN(16, 3)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
-        
-        # Load pre-trained model if provided
-        if self.model_path and os.path.exists(self.model_path):
-            print(f"Loading pre-trained model from {self.model_path}")
-            self.policy_net.load_state_dict(torch.load(self.model_path))
-        
-        # Move models to device
-        self.policy_net.to(self.device)
-        self.target_net.to(self.device)
-        
-        # Initialize environment and agent
+        # Initialize environment
         self.env = StockTradingEnv(self.df_normalized)
-        self.agent = DQNAgent(self.env, self.policy_net, self.target_net)
         
-        print(f"Models initialized on device: {self.device}")
+        # Initialize PPO agent
+        self.agent = PPOAgent(
+            env=self.env,
+            input_dim=16,  # 16 features
+            output_dim=3,  # 3 actions (hold, buy, sell)
+            lr=3e-4,
+            gamma=0.99,
+            clip_ratio=0.2,
+            value_coef=0.5,
+            entropy_coef=0.01,
+            update_epochs=10,
+            batch_size=64
+        )
+        
+        # Load pre-trained models if provided
+        if self.actor_model_path and self.critic_model_path:
+            if os.path.exists(self.actor_model_path) and os.path.exists(self.critic_model_path):
+                print(f"Loading pre-trained models from {self.actor_model_path} and {self.critic_model_path}")
+                self.agent.load_models(self.actor_model_path, self.critic_model_path)
+        
+        print(f"PPO models initialized on device: {self.device}")
     
     def get_state(self, df: pd.DataFrame, current_step: int) -> np.ndarray:
         """
@@ -248,22 +262,6 @@ class DQNTradingTrainer:
                                          consecutive_success_bonus: float = 0.15) -> float:
         """
         Comprehensive reward function optimized for scalping.
-        
-        Args:
-            delay: Time delay in seconds
-            action_type: Type of action ('success', 'failure', 'missed_opportunity', 'no_action')
-            success_base_reward: Base reward for successful trades
-            failure_base_penalty: Base penalty for failed trades
-            min_delay_threshold: Minimum delay threshold in minutes
-            max_reward: Maximum possible reward
-            decay_rate: Exponential decay rate
-            opportunity_cost_factor: Factor for opportunity cost calculation
-            missed_opp_multiplier: Multiplier for missed opportunity penalty
-            consecutive_successes: Number of consecutive successful trades
-            consecutive_success_bonus: Bonus factor for consecutive successes
-            
-        Returns:
-            Calculated reward value
         """
         delay = delay / 60  # Convert to minutes
         
@@ -312,7 +310,7 @@ class DQNTradingTrainer:
     
     def train_episode(self, episode: int) -> Dict[str, Any]:
         """
-        Train a single episode.
+        Train a single episode using PPO.
         
         Args:
             episode: Current episode number
@@ -334,16 +332,15 @@ class DQNTradingTrainer:
         
         while step < len(self.df_normalized):
             state = self.get_state(self.df_normalized, step)
-            action = self.agent.select_action(state)
+            action, log_prob, value = self.agent.select_action(state)
             done = False
             
             if action == 1:  # BUY
-                next_state = self.target_buy.iloc[step]
-                next_state_index = next_state["next_state_index"]
-                next_state2 = self.df_normalized.iloc[next_state_index].copy()
+                next_state_row = self.target_buy.iloc[step]
+                next_state_index = next_state_row["next_state_index"]
                 
                 reward = 0
-                if next_state['action'] == "Target Hit":
+                if next_state_row['action'] == "Target Hit":
                     wins += 1
                     consecutive_success += 1
                     reward = self.calculate_optimized_scalping_reward(
@@ -351,7 +348,7 @@ class DQNTradingTrainer:
                         action_type="success",
                         consecutive_successes=consecutive_success
                     )
-                elif next_state['action'] == "Stop Loss Hit":
+                elif next_state_row['action'] == "Stop Loss Hit":
                     defeat += 1
                     consecutive_success = 0
                     reward = self.calculate_optimized_scalping_reward(
@@ -359,7 +356,7 @@ class DQNTradingTrainer:
                         action_type="failure",
                         consecutive_successes=consecutive_success
                     )
-                elif next_state['action'] == "End of Day":
+                elif next_state_row['action'] == "End of Day":
                     lose += 1
                     consecutive_success = 0
                     done = True
@@ -369,20 +366,17 @@ class DQNTradingTrainer:
                         consecutive_successes=consecutive_success
                     )
                 
-                reward = float(reward)
-                next_state2 = np.array(next_state2.values, dtype=np.float32)
-                self.agent.store_transition(state, action, reward, next_state2, done)
-                self.agent.update_policy()
+                # Store transition
+                self.agent.store_transition(state, action, reward, log_prob, value, done)
                 number_trans += 1
                 next_step = next_state_index + 1
                 
             elif action == 2:  # SELL
-                next_state = self.target_sell.iloc[step]
-                next_state_index = next_state["next_state_index"]
-                next_state2 = self.df_normalized.iloc[next_state_index].copy()
+                next_state_row = self.target_sell.iloc[step]
+                next_state_index = next_state_row["next_state_index"]
                 
                 reward = 0
-                if next_state['action'] == "Target Hit":
+                if next_state_row['action'] == "Target Hit":
                     wins += 1
                     consecutive_success += 1
                     reward = self.calculate_optimized_scalping_reward(
@@ -390,7 +384,7 @@ class DQNTradingTrainer:
                         action_type="success",
                         consecutive_successes=consecutive_success
                     )
-                elif next_state['action'] == "Stop Loss Hit":
+                elif next_state_row['action'] == "Stop Loss Hit":
                     consecutive_success = 0
                     defeat += 1
                     reward = self.calculate_optimized_scalping_reward(
@@ -398,7 +392,7 @@ class DQNTradingTrainer:
                         action_type="failure",
                         consecutive_successes=consecutive_success
                     )
-                elif next_state['action'] == "End of Day":
+                elif next_state_row['action'] == "End of Day":
                     consecutive_success = 0
                     lose += 1
                     done = True
@@ -408,10 +402,8 @@ class DQNTradingTrainer:
                         consecutive_successes=consecutive_success
                     )
                 
-                reward = float(reward)
-                next_state2 = np.array(next_state2.values, dtype=np.float32)
-                self.agent.store_transition(state, action, reward, next_state2, done)
-                self.agent.update_policy()
+                # Store transition
+                self.agent.store_transition(state, action, reward, log_prob, value, done)
                 number_trans += 1
                 next_step = next_state_index + 1
                 
@@ -434,25 +426,25 @@ class DQNTradingTrainer:
                 else:
                     reward = 100
                 
-                if step + 1 < len(self.df_normalized):
-                    next_state = self.get_state(self.df_normalized, step + 1)
-                    reward = float(reward)
-                    self.agent.store_transition(state, action, reward, next_state, done)
-                    self.agent.update_policy()
-                else:
-                    done = True
-                    next_state = self.get_state(self.df_normalized, -1)
-                    reward = float(reward)
-                    self.agent.store_transition(state, action, reward, next_state, done)
-                    self.agent.update_policy()
-                
+                # Store transition
+                self.agent.store_transition(state, action, reward, log_prob, value, done)
                 next_step = step + 1
             
-            total_reward += reward if 'reward' in locals() else 0
+            total_reward += reward
+            
+            # Update PPO policy at specified frequency
+            self.step_count += 1
+            if self.step_count % self.update_frequency == 0:
+                self.agent.update_policy()
+            
             pbar.update(next_step - step)
             step = next_step
         
         pbar.close()
+        
+        # Update policy at end of episode if we haven't updated recently
+        if len(self.agent.memory.states) > 0:
+            self.agent.update_policy()
         
         return {
             'episode': episode,
@@ -472,32 +464,33 @@ class DQNTradingTrainer:
             start_episode: Episode to start training from (for resuming)
             save_frequency: Frequency of model saving (every N episodes)
         """
-        print(f"Starting training for {self.num_epochs} episodes...")
+        print(f"Starting PPO training for {self.num_epochs} episodes...")
         print(f"Models will be saved every {save_frequency} episodes to {self.save_folder}")
-        
         
         for episode in range(start_episode, self.num_epochs):
             # Train episode
             episode_stats = self.train_episode(episode)
             episode_df = pd.DataFrame([episode_stats])
             
-
+            # Save episode statistics
             if not os.path.exists(self.stats_csv):
                 episode_df.to_csv(self.stats_csv, index=False)
             else:
                 episode_df.to_csv(self.stats_csv, mode='a', index=False, header=False)
             
-            # Update target network and save model periodically
+            # Save models periodically
             if episode % save_frequency == 0:
-                self.target_net.load_state_dict(self.policy_net.state_dict())
-                
-                # Save model
-                model_save_path = os.path.join(
+                # Save models
+                actor_save_path = os.path.join(
                     self.weights_folder, 
-                    f'{self.symbol.lower()}_{self.start_date.replace("-", "_")}_{episode + 1}.pth'
+                    f'{self.symbol.lower()}_{self.start_date.replace("-", "_")}_actor_{episode + 1}.pth'
                 )
-                torch.save(self.policy_net.state_dict(), model_save_path)
-
+                critic_save_path = os.path.join(
+                    self.weights_folder, 
+                    f'{self.symbol.lower()}_{self.start_date.replace("-", "_")}_critic_{episode + 1}.pth'
+                )
+                
+                self.agent.save_models(actor_save_path, critic_save_path)
                 
                 # Print statistics
                 print(f"\nEpisode {episode + 1}/{self.num_epochs}")
@@ -507,9 +500,8 @@ class DQNTradingTrainer:
                       f"Defeats: {episode_stats['defeat']}")
                 print(f"Win Rate: {episode_stats['win_rate']:.2f}%")
                 print(f"Total Reward: {episode_stats['total_reward']:.2f}")
-                print(f"Model saved to: {model_save_path}")
+                print(f"Models saved to: {actor_save_path} and {critic_save_path}")
                 
-    
     def run_full_training_pipeline(self, additional_csv_path: str = None, start_episode: int = 0):
         """
         Run the complete training pipeline from data loading to model training.
@@ -518,12 +510,13 @@ class DQNTradingTrainer:
             additional_csv_path: Path to additional CSV data to include
             start_episode: Episode to start training from
         """
-        print(f"Starting full training pipeline for {self.symbol}")
+        print(f"Starting full PPO training pipeline for {self.symbol}")
         print(f"Training parameters:")
         print(f"  Target profit: {self.target_profit}")
         print(f"  Stop loss: {self.stop_loss}")
         print(f"  Number of epochs: {self.num_epochs}")
         print(f"  Device: {self.device}")
+        print(f"  Update frequency: {self.update_frequency}")
         
         # Load and prepare data
         self.load_data(additional_csv_path)
@@ -536,13 +529,13 @@ class DQNTradingTrainer:
         # Start training
         self.train(start_episode)
         
-        print("Training completed successfully!")
+        print("PPO Training completed successfully!")
 
 
 # Example usage:
 if __name__ == "__main__":
     # Create trainer instance
-    parser = argparse.ArgumentParser(description="Train DQN Trading Agent")
+    parser = argparse.ArgumentParser(description="Train PPO Trading Agent")
     parser.add_argument("--symbol", type=str, required=True, help="Stock symbol")
     parser.add_argument("--start_date", type=str, required=True, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end_date", type=str, required=True, help="End date (YYYY-MM-DD)")
@@ -550,13 +543,15 @@ if __name__ == "__main__":
     parser.add_argument("--target_profit", type=float, default=1.005, help="Target profit multiplier")
     parser.add_argument("--stop_loss", type=float, default=0.99, help="Stop loss multiplier")
     parser.add_argument("--save_folder", type=str, default=None, help="Folder to save trained models")
-    parser.add_argument("--model_path", type=str, default=None, help="Path to pre-trained model")
+    parser.add_argument("--actor_model_path", type=str, default=None, help="Path to pre-trained actor model")
+    parser.add_argument("--critic_model_path", type=str, default=None, help="Path to pre-trained critic model")
     parser.add_argument("--norm_params_path", type=str, default=None, help="Path to normalization params")
     parser.add_argument("--additional_csv", type=str, default=None, help="Path to additional CSV data")
     parser.add_argument("--start_episode", type=int, default=0, help="Episode to resume from")
+    parser.add_argument("--update_frequency", type=int, default=2048, help="PPO update frequency")
     args = parser.parse_args()
 
-    trainer = DQNTradingTrainer(
+    trainer = PPOTradingTrainer(
         symbol=args.symbol,
         start_date=args.start_date,
         end_date=args.end_date,
@@ -564,26 +559,32 @@ if __name__ == "__main__":
         stop_loss=args.stop_loss,
         num_epochs=args.num_epochs,
         save_folder=args.save_folder,
-        model_path=args.model_path,
-        norm_params_path=args.norm_params_path
+        actor_model_path=args.actor_model_path,
+        critic_model_path=args.critic_model_path,
+        norm_params_path=args.norm_params_path,
+        update_frequency=args.update_frequency
     )
 
     trainer.run_full_training_pipeline(
         additional_csv_path=args.additional_csv,
         start_episode=args.start_episode
     )
-# Example command1 to run:
-# python trainer.py --symbol SUZLON --start_date 2023-01-01 --end_date 2023-12-31 --num_epochs 3000
 
-# Example command2 to run:
-# python train_dqn.py \
+# Example command to run:
+# python ppo_trainer.py --symbol SUZLON --start_date 2023-01-01 --end_date 2023-12-31 --num_epochs 3000 --update_frequency 2048
+
+# Example command with pre-trained models:
+# python ppo_trainer.py \
 #     --symbol SUZLON \
 #     --start_date 2025-06-15 \
 #     --end_date 2025-06-19 \
 #     --num_epochs 3000 \
 #     --target_profit 1.005 \
 #     --stop_loss 0.99 \
-#     --save_folder ./trained_models/suzlon_training \
+#     --save_folder ./trained_models/suzlon_ppo_training \
+#     --actor_model_path ./trained_models/suzlon_actor.pth \
+#     --critic_model_path ./trained_models/suzlon_critic.pth \
 #     --norm_params_path ./json_files/suzlon_norm_params.json \
 #     --additional_csv ./suzlon_2025-06-19.csv \
-#     --start_episode 0
+#     --start_episode 0 \
+#     --update_frequency 1024

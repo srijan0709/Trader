@@ -4,7 +4,8 @@ import torch.optim as optim
 import random
 from collections import deque
 import numpy as np
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = 'cpu'
 
 
 class DQN(nn.Module):
